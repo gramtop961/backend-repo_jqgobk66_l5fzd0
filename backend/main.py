@@ -1,10 +1,10 @@
 import os
-from datetime import datetime, timedelta, date
+from datetime import datetime, date
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 
 from database import db, create_document, get_documents
 from schemas import (
@@ -16,6 +16,7 @@ from schemas import (
 
 import smtplib
 from email.mime.text import MIMEText
+from bson import ObjectId
 
 app = FastAPI(title="Booking Engine API")
 
@@ -67,7 +68,7 @@ def test_database():
 def generate_confirmation_code(prefix: str = "RES") -> str:
     return f"{prefix}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
-# Email sending helper (simple SMTP). In this environment, we'll attempt to use SMTP_HOST/PORT/USER/PASS env vars.
+# Email sending helper (simple SMTP)
 
 def send_email(notification: EmailNotification) -> bool:
     host = os.getenv("SMTP_HOST")
@@ -124,7 +125,7 @@ def list_room_types(property_id: Optional[str] = None):
 def search_availability(payload: AvailabilitySearch):
     # Simple availability: all room types for the property are available with base price.
     room_types = get_documents("roomtype", {"property_id": payload.property_id})
-    items = []
+    items: List[AvailabilityResultItem] = []
     for rt in room_types:
         items.append(AvailabilityResultItem(
             room_type_id=str(rt.get("_id")),
@@ -141,10 +142,10 @@ def search_availability(payload: AvailabilitySearch):
 @app.post("/api/reservations", response_model=dict)
 def create_reservation(payload: CreateReservationRequest):
     # Price calculation: simple nightly price * nights
-    room = db["roomtype"].find_one({"_id": {"$eq": db.roomtype._Database__client.codec_options.document_class().from_dict({})}})
-    # Fallback: fetch by id string
-    from bson import ObjectId
-    rt = db["roomtype"].find_one({"_id": ObjectId(payload.room_type_id)})
+    try:
+        rt = db["roomtype"].find_one({"_id": ObjectId(payload.room_type_id)})
+    except Exception:
+        rt = None
     if not rt:
         raise HTTPException(status_code=404, detail="Room type not found")
 
@@ -174,12 +175,13 @@ def create_reservation(payload: CreateReservationRequest):
     # Send email notification
     to_email = os.getenv("BOOKING_NOTIFICATION_EMAIL", reservation.guest.email)
     subject = f"New Reservation {confirmation_code}"
+    nights_text = nights
     body = f"""
     <h2>New Reservation</h2>
     <p><strong>Confirmation:</strong> {confirmation_code}</p>
     <p><strong>Property:</strong> {reservation.property_id}</p>
     <p><strong>Room Type:</strong> {reservation.room_type_id}</p>
-    <p><strong>Dates:</strong> {reservation.check_in} to {reservation.check_out} ({nights} nights)</p>
+    <p><strong>Dates:</strong> {reservation.check_in} to {reservation.check_out} ({nights_text} nights)</p>
     <p><strong>Guest:</strong> {reservation.guest.first_name} {reservation.guest.last_name} ({reservation.guest.email})</p>
     <p><strong>Total:</strong> {reservation.total_price} {reservation.currency}</p>
     <p><strong>Channel:</strong> {reservation.channel}</p>
@@ -210,9 +212,11 @@ def ota_webhook(payload: OTAWebhookPayload):
         raise HTTPException(status_code=400, detail="check_out must be after check_in")
 
     # If total_price not provided, attempt simple calc from room type base_price
-    from bson import ObjectId
-    rt = db["roomtype"].find_one({"_id": ObjectId(payload.room_type_id)})
-    base_price = float(rt.get("base_price", 0)) if rt else 0.0
+    try:
+        rt = db["roomtype"].find_one({"_id": ObjectId(payload.room_type_id)})
+        base_price = float(rt.get("base_price", 0)) if rt else 0.0
+    except Exception:
+        base_price = 0.0
     total_price = payload.total_price if payload.total_price is not None else base_price * nights
 
     reservation = Reservation(
